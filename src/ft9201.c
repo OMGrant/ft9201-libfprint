@@ -75,7 +75,7 @@
 #define REG_DIM_H               0x15
 #define REG_MCU_STATUS          0x20  /* [0xa5,0x5a] → ready */
 #define REG_DATA_READY          0x30  /* 0xbb → image available */
-#define REG_FINGER              0x1d  /* 0x01/0xa0 → finger present */
+#define REG_FINGER              0x1d  /* 0x01 idle, 0xa0 finger present */
 #define REG_VARIANT_CFG1        0x22  /* variant config byte 1 (write 0x00) */
 #define REG_VARIANT_CFG2        0x23  /* variant config byte 2 (write 0x0e) */
 #define REG_POWER_1F            0x1f  /* AFE power control (write 0x01 to power on) */
@@ -252,6 +252,15 @@ enum {
 
 /* ---- preamble callbacks ---- */
 
+/* FT9348W (types 2/3) and the 0x3c unit seen on 2808:93a9 (type 14) need the
+ * extra AFE power-on writes. */
+static gboolean
+needs_afe_power_on (FpiDeviceFt9201 *self)
+{
+  return self->sensor_variant == 2 || self->sensor_variant == 3 ||
+         self->sensor_variant == 14;
+}
+
 static void
 ignore_read_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
 {
@@ -353,6 +362,15 @@ read_h_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
   FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
   if (err) { fpi_ssm_mark_failed (t->ssm, err); return; }
   self->sensor_height = t->buffer[0] ? t->buffer[0] : DEFAULT_HEIGHT;
+
+  /* Type 14 reports 96x96 but sends a 64x80 frame in the first 5120 bytes;
+   * the rest of the buffer is noise. */
+  if (self->sensor_variant == 14)
+    {
+      self->sensor_width  = 64;
+      self->sensor_height = 80;
+    }
+
   fp_dbg ("ft9201: sensor %ux%u", self->sensor_width, self->sensor_height);
   fpi_ssm_next_state (t->ssm);
 }
@@ -541,25 +559,25 @@ init_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
 
     /* ---- variant 2/3 AFE power-on ---- */
     case INIT_POWER_CFG1:
-      if (self->sensor_variant == 2 || self->sensor_variant == 3)
+      if (needs_afe_power_on (self))
         ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x00, REG_VARIANT_CFG1);
       else
         fpi_ssm_next_state (ssm);
       break;
     case INIT_POWER_CFG2:
-      if (self->sensor_variant == 2 || self->sensor_variant == 3)
+      if (needs_afe_power_on (self))
         ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x0e, REG_VARIANT_CFG2);
       else
         fpi_ssm_next_state (ssm);
       break;
     case INIT_POWER_1F:
-      if (self->sensor_variant == 2 || self->sensor_variant == 3)
+      if (needs_afe_power_on (self))
         ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x01, REG_POWER_1F);
       else
         fpi_ssm_next_state (ssm);
       break;
     case INIT_POWER_1E:
-      if (self->sensor_variant == 2 || self->sensor_variant == 3)
+      if (needs_afe_power_on (self))
         ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x01, REG_POWER_1E);
       else
         fpi_ssm_next_state (ssm);
@@ -711,9 +729,14 @@ scan_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
   FpiUsbTransfer *t;
   gsize total;
 
+  /* Fail, don't complete cleanly: scan_ssm_complete restarts the scan on a
+   * clean completion with no accepted frame, which recurses forever once
+   * the cancellable stays cancelled. */
   if (g_cancellable_is_cancelled (fpi_device_get_cancellable (dev)))
     {
-      fpi_ssm_mark_completed (ssm);
+      fpi_ssm_mark_failed (ssm, g_error_new_literal (G_IO_ERROR,
+                                                     G_IO_ERROR_CANCELLED,
+                                                     "scan cancelled"));
       return;
     }
 
