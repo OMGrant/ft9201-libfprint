@@ -711,9 +711,14 @@ scan_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
   FpiUsbTransfer *t;
   gsize total;
 
+  /* Fail, don't complete cleanly: scan_ssm_complete restarts the scan on a
+   * clean completion with no accepted frame, which recurses forever once
+   * the cancellable stays cancelled. */
   if (g_cancellable_is_cancelled (fpi_device_get_cancellable (dev)))
     {
-      fpi_ssm_mark_completed (ssm);
+      fpi_ssm_mark_failed (ssm, g_error_new_literal (G_IO_ERROR,
+                                                     G_IO_ERROR_CANCELLED,
+                                                     "scan cancelled"));
       return;
     }
 
