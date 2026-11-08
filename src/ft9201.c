@@ -883,6 +883,54 @@ scan_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
 static void start_scan (FpDevice *dev);  /* forward declaration */
 
 static void
+match_complete (FpDevice *dev, GError *error)
+{
+  if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_IDENTIFY)
+    fpi_device_identify_complete (dev, error);
+  else
+    fpi_device_verify_complete (dev, error);
+}
+
+/* Returns a copy of the engine template stored in @print, or NULL. */
+static guint8 *
+print_template (FpPrint *print, gsize *len)
+{
+  g_autoptr(GVariant) data = NULL;
+  g_autoptr(GVariant) arr = NULL;
+  const guint8 *stored;
+
+  g_object_get (print, "fpi-data", &data, NULL);
+  if (!data || !g_variant_check_format_string (data, "(@ay)", FALSE))
+    return NULL;
+
+  g_variant_get (data, "(@ay)", &arr);
+  stored = g_variant_get_fixed_array (arr, len, 1);
+  return *len ? g_memdup2 (stored, *len) : NULL;
+}
+
+static void
+identify_scan (FpDevice *dev)
+{
+  GPtrArray *prints;
+  FpPrint *found = NULL;
+
+  fpi_device_get_identify_data (dev, &prints);
+  for (guint i = 0; i < prints->len && !found; i++)
+    {
+      FpPrint *print = g_ptr_array_index (prints, i);
+      gsize len = 0;
+      g_autofree guint8 *tmpl = print_template (print, &len);
+
+      if (tmpl && ft_engine_verify (tmpl, len))
+        found = print;
+    }
+
+  fp_info ("ft9201: engine identify -> %s", found ? "MATCH" : "no match");
+  fpi_device_identify_report (dev, found, NULL, NULL);
+  fpi_device_identify_complete (dev, NULL);
+}
+
+static void
 scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
@@ -891,7 +939,7 @@ scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   if (error)
     {
       if (self->is_verify)
-        fpi_device_verify_complete (dev, error);
+        match_complete (dev, error);
       else
         fpi_device_enroll_complete (dev, NULL, error);
       return;
@@ -919,7 +967,7 @@ scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
       GError *e = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
                                             "ft9201: vendor engine not loaded");
       if (self->is_verify)
-        fpi_device_verify_complete (dev, e);
+        match_complete (dev, e);
       else
         fpi_device_enroll_complete (dev, NULL, e);
       return;
@@ -940,6 +988,13 @@ scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
       GError *retry = fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER);
       fpi_device_enroll_progress (dev, self->enroll_done, NULL, g_steal_pointer (&retry));
       start_scan (dev);
+      return;
+    }
+
+  if (self->is_verify &&
+      fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_IDENTIFY)
+    {
+      identify_scan (dev);
       return;
     }
 
@@ -1078,29 +1133,25 @@ dev_verify (FpDevice *dev)
   (void) img_bytes;
   fpi_device_get_verify_data (dev, &self->cur_print);
 
-  /* Load the opaque engine template blob from the stored print. */
-  GVariant *data = NULL;
-  g_object_get (self->cur_print, "fpi-data", &data, NULL);
-  if (!data || !g_variant_check_format_string (data, "(@ay)", FALSE))
+  g_clear_pointer (&self->tmpl_blob, g_free);
+  self->tmpl_blob = print_template (self->cur_print, &self->tmpl_len);
+  if (!self->tmpl_blob)
     {
-      if (data) g_variant_unref (data);
       fpi_device_verify_complete (dev,
         fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
                                   "ft9201: stored template invalid"));
       return;
     }
 
-  GVariant *arr = NULL;
-  g_variant_get (data, "(@ay)", &arr);
-  gsize stored_len = 0;
-  const guint8 *stored = g_variant_get_fixed_array (arr, &stored_len, 1);
+  self->is_verify      = TRUE;
+  self->has_background = FALSE;
+  start_scan (dev);
+}
 
-  g_clear_pointer (&self->tmpl_blob, g_free);
-  self->tmpl_blob = g_malloc (stored_len);
-  memcpy (self->tmpl_blob, stored, stored_len);
-  self->tmpl_len  = stored_len;
-  g_variant_unref (arr);
-  g_variant_unref (data);
+static void
+dev_identify (FpDevice *dev)
+{
+  FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
 
   self->is_verify      = TRUE;
   self->has_background = FALSE;
@@ -1137,7 +1188,8 @@ fpi_device_ft9201_class_init (FpiDeviceFt9201Class *klass)
   dev_class->open    = dev_open;
   dev_class->close   = dev_close;
   dev_class->enroll  = dev_enroll;
-  dev_class->verify  = dev_verify;
+  dev_class->verify   = dev_verify;
+  dev_class->identify = dev_identify;
   dev_class->cancel  = dev_cancel;
 
   fpi_device_class_auto_initialize_features (dev_class);
