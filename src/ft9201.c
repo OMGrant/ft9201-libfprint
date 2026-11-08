@@ -835,8 +835,11 @@ scan_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
 
         if (self->scan_ok)
           {
-            /* FPN correction */
-            if (self->has_background && !g_getenv ("FP_NO_FPN"))
+            /* FPN correction. Skipped on the 64x80 variant: its background
+             * frame is mostly zeros, and subtracting it clips the image. */
+            if (self->has_background &&
+                self->sensor_variant != SENSOR_TYPE_64X80 &&
+                !g_getenv ("FP_NO_FPN"))
               for (gsize i = 0; i < img_bytes; i++)
                 {
                   gint v = (gint) self->image_buf[i]
