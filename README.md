@@ -34,7 +34,8 @@ Developed and tested against
 the FT9348W variant of `2808:93a9`.
 
 Caveats:
-- Tested only on that FT9348W variant of the `2808:93a9` device.
+- Tested on the FT9348W variant of the `2808:93a9` device, and on a variant
+  that reports sensor type 0x3c (64x80 frames).
 - The matcher is a proprietary blob we call into; we can't fix bugs inside it.
 - x86-64 only (the DLL and loader are 64-bit).
 
