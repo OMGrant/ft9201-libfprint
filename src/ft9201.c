@@ -92,6 +92,12 @@
 /* Firmware chunk size */
 #define FW_CHUNK                64
 
+/* Sensor type, bits 1..4 of SPI register 0xf3 */
+#define SENSOR_TYPE_FT9348W     2
+#define SENSOR_TYPE_FT9348W_B   3
+#define SENSOR_TYPE_FT9361W     4
+#define SENSOR_TYPE_64X80       14  /* raw 0x3c: native 64x80 frame */
+
 /* ------------------------------------------------------------------ */
 /* Device struct                                                        */
 /* ------------------------------------------------------------------ */
@@ -257,8 +263,9 @@ enum {
 static gboolean
 needs_afe_power_on (FpiDeviceFt9201 *self)
 {
-  return self->sensor_variant == 2 || self->sensor_variant == 3 ||
-         self->sensor_variant == 14;
+  return self->sensor_variant == SENSOR_TYPE_FT9348W ||
+         self->sensor_variant == SENSOR_TYPE_FT9348W_B ||
+         self->sensor_variant == SENSOR_TYPE_64X80;
 }
 
 static void
@@ -299,8 +306,10 @@ spi_r_f3_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
   self->sensor_variant = type;
   fp_dbg ("ft9201: SPI type_raw=0x%02x  sensor_type=%u (%s)",
           raw, type,
-          type == 2 ? "FT9348W" : type == 3 ? "FT9348W(var)" :
-          type == 4 ? "FT9361W" : "unknown");
+          type == SENSOR_TYPE_FT9348W   ? "FT9348W" :
+          type == SENSOR_TYPE_FT9348W_B ? "FT9348W(var)" :
+          type == SENSOR_TYPE_FT9361W   ? "FT9361W" :
+          type == SENSOR_TYPE_64X80     ? "64x80" : "unknown");
   fpi_ssm_next_state (t->ssm);
 }
 
@@ -365,7 +374,7 @@ read_h_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
 
   /* Type 14 reports 96x96 but sends a 64x80 frame in the first 5120 bytes;
    * the rest of the buffer is noise. */
-  if (self->sensor_variant == 14)
+  if (self->sensor_variant == SENSOR_TYPE_64X80)
     {
       self->sensor_width  = 64;
       self->sensor_height = 80;
