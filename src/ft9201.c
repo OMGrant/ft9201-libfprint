@@ -75,7 +75,7 @@
 #define REG_DIM_H               0x15
 #define REG_MCU_STATUS          0x20  /* [0xa5,0x5a] → ready */
 #define REG_DATA_READY          0x30  /* 0xbb → image available */
-#define REG_FINGER              0x1d  /* 0x01/0xa0 → finger present */
+#define REG_FINGER              0x1d  /* 0x01 idle, 0xa0 finger present */
 #define REG_VARIANT_CFG1        0x22  /* variant config byte 1 (write 0x00) */
 #define REG_VARIANT_CFG2        0x23  /* variant config byte 2 (write 0x0e) */
 #define REG_POWER_1F            0x1f  /* AFE power control (write 0x01 to power on) */
@@ -91,6 +91,12 @@
 
 /* Firmware chunk size */
 #define FW_CHUNK                64
+
+/* Sensor type, bits 1..4 of SPI register 0xf3 */
+#define SENSOR_TYPE_FT9348W     2
+#define SENSOR_TYPE_FT9348W_B   3
+#define SENSOR_TYPE_FT9361W     4
+#define SENSOR_TYPE_64X80       14  /* raw 0x3c: native 64x80 frame */
 
 /* ------------------------------------------------------------------ */
 /* Device struct                                                        */
@@ -252,6 +258,16 @@ enum {
 
 /* ---- preamble callbacks ---- */
 
+/* FT9348W (types 2/3) and the 0x3c unit seen on 2808:93a9 (type 14) need the
+ * extra AFE power-on writes. */
+static gboolean
+needs_afe_power_on (FpiDeviceFt9201 *self)
+{
+  return self->sensor_variant == SENSOR_TYPE_FT9348W ||
+         self->sensor_variant == SENSOR_TYPE_FT9348W_B ||
+         self->sensor_variant == SENSOR_TYPE_64X80;
+}
+
 static void
 ignore_read_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
 {
@@ -290,8 +306,10 @@ spi_r_f3_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
   self->sensor_variant = type;
   fp_dbg ("ft9201: SPI type_raw=0x%02x  sensor_type=%u (%s)",
           raw, type,
-          type == 2 ? "FT9348W" : type == 3 ? "FT9348W(var)" :
-          type == 4 ? "FT9361W" : "unknown");
+          type == SENSOR_TYPE_FT9348W   ? "FT9348W" :
+          type == SENSOR_TYPE_FT9348W_B ? "FT9348W(var)" :
+          type == SENSOR_TYPE_FT9361W   ? "FT9361W" :
+          type == SENSOR_TYPE_64X80     ? "64x80" : "unknown");
   fpi_ssm_next_state (t->ssm);
 }
 
@@ -353,6 +371,15 @@ read_h_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
   FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
   if (err) { fpi_ssm_mark_failed (t->ssm, err); return; }
   self->sensor_height = t->buffer[0] ? t->buffer[0] : DEFAULT_HEIGHT;
+
+  /* Type 14 reports 96x96 but sends a 64x80 frame in the first 5120 bytes;
+   * the rest of the buffer is noise. */
+  if (self->sensor_variant == SENSOR_TYPE_64X80)
+    {
+      self->sensor_width  = 64;
+      self->sensor_height = 80;
+    }
+
   fp_dbg ("ft9201: sensor %ux%u", self->sensor_width, self->sensor_height);
   fpi_ssm_next_state (t->ssm);
 }
@@ -541,25 +568,25 @@ init_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
 
     /* ---- variant 2/3 AFE power-on ---- */
     case INIT_POWER_CFG1:
-      if (self->sensor_variant == 2 || self->sensor_variant == 3)
+      if (needs_afe_power_on (self))
         ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x00, REG_VARIANT_CFG1);
       else
         fpi_ssm_next_state (ssm);
       break;
     case INIT_POWER_CFG2:
-      if (self->sensor_variant == 2 || self->sensor_variant == 3)
+      if (needs_afe_power_on (self))
         ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x0e, REG_VARIANT_CFG2);
       else
         fpi_ssm_next_state (ssm);
       break;
     case INIT_POWER_1F:
-      if (self->sensor_variant == 2 || self->sensor_variant == 3)
+      if (needs_afe_power_on (self))
         ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x01, REG_POWER_1F);
       else
         fpi_ssm_next_state (ssm);
       break;
     case INIT_POWER_1E:
-      if (self->sensor_variant == 2 || self->sensor_variant == 3)
+      if (needs_afe_power_on (self))
         ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x01, REG_POWER_1E);
       else
         fpi_ssm_next_state (ssm);
@@ -711,9 +738,14 @@ scan_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
   FpiUsbTransfer *t;
   gsize total;
 
+  /* Fail, don't complete cleanly: scan_ssm_complete restarts the scan on a
+   * clean completion with no accepted frame, which recurses forever once
+   * the cancellable stays cancelled. */
   if (g_cancellable_is_cancelled (fpi_device_get_cancellable (dev)))
     {
-      fpi_ssm_mark_completed (ssm);
+      fpi_ssm_mark_failed (ssm, g_error_new_literal (G_IO_ERROR,
+                                                     G_IO_ERROR_CANCELLED,
+                                                     "scan cancelled"));
       return;
     }
 
@@ -803,8 +835,11 @@ scan_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
 
         if (self->scan_ok)
           {
-            /* FPN correction */
-            if (self->has_background && !g_getenv ("FP_NO_FPN"))
+            /* FPN correction. Skipped on the 64x80 variant: its background
+             * frame is mostly zeros, and subtracting it clips the image. */
+            if (self->has_background &&
+                self->sensor_variant != SENSOR_TYPE_64X80 &&
+                !g_getenv ("FP_NO_FPN"))
               for (gsize i = 0; i < img_bytes; i++)
                 {
                   gint v = (gint) self->image_buf[i]
@@ -848,6 +883,54 @@ scan_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
 static void start_scan (FpDevice *dev);  /* forward declaration */
 
 static void
+match_complete (FpDevice *dev, GError *error)
+{
+  if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_IDENTIFY)
+    fpi_device_identify_complete (dev, error);
+  else
+    fpi_device_verify_complete (dev, error);
+}
+
+/* Returns a copy of the engine template stored in @print, or NULL. */
+static guint8 *
+print_template (FpPrint *print, gsize *len)
+{
+  g_autoptr(GVariant) data = NULL;
+  g_autoptr(GVariant) arr = NULL;
+  const guint8 *stored;
+
+  g_object_get (print, "fpi-data", &data, NULL);
+  if (!data || !g_variant_check_format_string (data, "(@ay)", FALSE))
+    return NULL;
+
+  g_variant_get (data, "(@ay)", &arr);
+  stored = g_variant_get_fixed_array (arr, len, 1);
+  return *len ? g_memdup2 (stored, *len) : NULL;
+}
+
+static void
+identify_scan (FpDevice *dev)
+{
+  GPtrArray *prints;
+  FpPrint *found = NULL;
+
+  fpi_device_get_identify_data (dev, &prints);
+  for (guint i = 0; i < prints->len && !found; i++)
+    {
+      FpPrint *print = g_ptr_array_index (prints, i);
+      gsize len = 0;
+      g_autofree guint8 *tmpl = print_template (print, &len);
+
+      if (tmpl && ft_engine_verify (tmpl, len))
+        found = print;
+    }
+
+  fp_info ("ft9201: engine identify -> %s", found ? "MATCH" : "no match");
+  fpi_device_identify_report (dev, found, NULL, NULL);
+  fpi_device_identify_complete (dev, NULL);
+}
+
+static void
 scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
@@ -856,7 +939,7 @@ scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   if (error)
     {
       if (self->is_verify)
-        fpi_device_verify_complete (dev, error);
+        match_complete (dev, error);
       else
         fpi_device_enroll_complete (dev, NULL, error);
       return;
@@ -884,7 +967,7 @@ scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
       GError *e = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
                                             "ft9201: vendor engine not loaded");
       if (self->is_verify)
-        fpi_device_verify_complete (dev, e);
+        match_complete (dev, e);
       else
         fpi_device_enroll_complete (dev, NULL, e);
       return;
@@ -905,6 +988,13 @@ scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
       GError *retry = fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER);
       fpi_device_enroll_progress (dev, self->enroll_done, NULL, g_steal_pointer (&retry));
       start_scan (dev);
+      return;
+    }
+
+  if (self->is_verify &&
+      fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_IDENTIFY)
+    {
+      identify_scan (dev);
       return;
     }
 
@@ -1043,29 +1133,25 @@ dev_verify (FpDevice *dev)
   (void) img_bytes;
   fpi_device_get_verify_data (dev, &self->cur_print);
 
-  /* Load the opaque engine template blob from the stored print. */
-  GVariant *data = NULL;
-  g_object_get (self->cur_print, "fpi-data", &data, NULL);
-  if (!data || !g_variant_check_format_string (data, "(@ay)", FALSE))
+  g_clear_pointer (&self->tmpl_blob, g_free);
+  self->tmpl_blob = print_template (self->cur_print, &self->tmpl_len);
+  if (!self->tmpl_blob)
     {
-      if (data) g_variant_unref (data);
       fpi_device_verify_complete (dev,
         fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
                                   "ft9201: stored template invalid"));
       return;
     }
 
-  GVariant *arr = NULL;
-  g_variant_get (data, "(@ay)", &arr);
-  gsize stored_len = 0;
-  const guint8 *stored = g_variant_get_fixed_array (arr, &stored_len, 1);
+  self->is_verify      = TRUE;
+  self->has_background = FALSE;
+  start_scan (dev);
+}
 
-  g_clear_pointer (&self->tmpl_blob, g_free);
-  self->tmpl_blob = g_malloc (stored_len);
-  memcpy (self->tmpl_blob, stored, stored_len);
-  self->tmpl_len  = stored_len;
-  g_variant_unref (arr);
-  g_variant_unref (data);
+static void
+dev_identify (FpDevice *dev)
+{
+  FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
 
   self->is_verify      = TRUE;
   self->has_background = FALSE;
@@ -1102,7 +1188,8 @@ fpi_device_ft9201_class_init (FpiDeviceFt9201Class *klass)
   dev_class->open    = dev_open;
   dev_class->close   = dev_close;
   dev_class->enroll  = dev_enroll;
-  dev_class->verify  = dev_verify;
+  dev_class->verify   = dev_verify;
+  dev_class->identify = dev_identify;
   dev_class->cancel  = dev_cancel;
 
   fpi_device_class_auto_initialize_features (dev_class);
